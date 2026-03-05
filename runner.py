@@ -1,6 +1,6 @@
 import argparse
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import yaml
 from dotenv import load_dotenv
 import os
@@ -161,6 +161,86 @@ def run_market_worker(ticker: str, dynamic_config: Dict, stop_event: threading.E
     finally:
         api.logout()
 
+def _cancel_resting_orders_for_ticker(
+    ticker: str,
+    dynamic_config: Dict,
+    logger: logging.Logger,
+    max_attempts: int = 3,
+    backoff_seconds: float = 1.0,
+) -> bool:
+    cleanup_logger = logging.getLogger(f"Cleanup_{ticker}")
+    cleanup_logger.setLevel(dynamic_config.get('log_level', 'INFO'))
+    if not cleanup_logger.handlers:
+        ch = logging.StreamHandler()
+        ch.setLevel(dynamic_config.get('log_level', 'INFO'))
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        ch.setFormatter(formatter)
+        cleanup_logger.addHandler(ch)
+
+    api = create_api(dynamic_config.get("api", {}), cleanup_logger, market_ticker=ticker)
+    try:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                orders = api.get_orders()
+                if not orders:
+                    cleanup_logger.info(f"No resting orders to cancel for {ticker}")
+                    return True
+
+                cleanup_logger.warning(
+                    f"Found {len(orders)} resting orders for {ticker}. Cancel attempt {attempt}/{max_attempts}"
+                )
+
+                for order in orders:
+                    order_id = order.get("order_id")
+                    if order_id is None:
+                        continue
+                    try:
+                        api.cancel_order(order_id)
+                    except requests.exceptions.RequestException as exc:
+                        cleanup_logger.error(f"Failed to cancel order {order_id} for {ticker}: {exc}")
+
+                time.sleep(backoff_seconds)
+            except requests.exceptions.RequestException as exc:
+                cleanup_logger.error(f"Order cleanup request failed for {ticker}: {exc}")
+                time.sleep(backoff_seconds)
+
+        remaining = api.get_orders()
+        if remaining:
+            logger.error(f"Cleanup incomplete for {ticker}: {len(remaining)} resting orders still present")
+            return False
+        return True
+    except requests.exceptions.RequestException as exc:
+        logger.error(f"Final cleanup verification failed for {ticker}: {exc}")
+        return False
+    finally:
+        api.logout()
+
+def _stop_worker_then_cancel(
+    ticker: str,
+    stop_event: threading.Event,
+    future,
+    dynamic_config: Dict,
+    logger: logging.Logger,
+) -> bool:
+    selector_cfg = dynamic_config.get("market_selector", {})
+    shutdown_timeout_seconds = _safe_float(
+        selector_cfg.get("worker_shutdown_timeout_seconds", 15),
+        15.0,
+    )
+
+    stop_event.set()
+    try:
+        future.result(timeout=shutdown_timeout_seconds)
+    except TimeoutError:
+        logger.error(
+            f"Worker {ticker} did not stop within {shutdown_timeout_seconds:.1f}s; deferring cleanup"
+        )
+        return False
+    except Exception as exc:
+        logger.error(f"Worker {ticker} exited with error during shutdown: {exc}")
+
+    return _cancel_resting_orders_for_ticker(ticker, dynamic_config, logger)
+
 def run_dynamic_strategy(dynamic_config: Dict):
     logger = logging.getLogger("DynamicSelector")
     log_level = dynamic_config.get('log_level', 'INFO')
@@ -227,11 +307,22 @@ def run_dynamic_strategy(dynamic_config: Dict):
                 logger.info(f"Selector found {len(markets)} open markets; selected: {selected_tickers}")
 
                 for ticker in list(active_workers.keys()):
-                    stop_event, _future = active_workers[ticker]
+                    stop_event, future = active_workers[ticker]
                     if ticker not in selected_set:
-                        logger.info(f"Stopping worker for {ticker} (no longer selected)")
-                        stop_event.set()
-                        del active_workers[ticker]
+                        logger.warning(f"Draining deselected ticker {ticker}: stop worker then cancel resting orders")
+                        is_clean = _stop_worker_then_cancel(
+                            ticker,
+                            stop_event,
+                            future,
+                            dynamic_config,
+                            logger,
+                        )
+                        if is_clean:
+                            del active_workers[ticker]
+                        else:
+                            logger.error(
+                                f"Could not fully clean up {ticker}; keeping worker state for next retry cycle"
+                            )
 
                 for ticker in selected_tickers:
                     if ticker not in active_workers:
@@ -244,8 +335,10 @@ def run_dynamic_strategy(dynamic_config: Dict):
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt, shutting down dynamic strategy")
         finally:
-            for stop_event, _future in active_workers.values():
-                stop_event.set()
+            for ticker in list(active_workers.keys()):
+                stop_event, future = active_workers[ticker]
+                logger.warning(f"Final shutdown cleanup for {ticker}")
+                _stop_worker_then_cancel(ticker, stop_event, future, dynamic_config, logger)
             selector_api.logout()
 
 def main():

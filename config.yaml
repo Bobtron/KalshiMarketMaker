@@ -4,12 +4,13 @@ dynamic:
     trade_side: "yes"
   market_selector:
     enabled: true
-    top_n: 30
+    top_n: 50
     refresh_seconds: 45
+    worker_shutdown_timeout_seconds: 15
     min_volume_24h: 0
-    min_spread_cents: 0
-    volume_weight: 0.35
-    spread_weight: 0.65
+    min_spread_cents: 2
+    volume_weight: 0.90
+    spread_weight: 0.10
     page_limit: 250
     max_pages: 5
     max_markets: 1250

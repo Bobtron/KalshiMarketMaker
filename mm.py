@@ -1,7 +1,7 @@
 import abc
 import time
 import base64
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import requests
 import logging
 import uuid
@@ -216,13 +216,52 @@ class KalshiTradingAPI(AbstractTradingAPI):
         self.logger.info(f"Canceled order with ID {order_id}, success: {success}")
         return success
 
-    def get_orders(self) -> List[Dict]:
+    def get_orders(self, ticker: Optional[str] = None, status: str = "resting") -> List[Dict]:
         self.logger.info("Retrieving orders...")
         path = "/portfolio/orders"
-        params = {"ticker": self.market_ticker, "status": "resting"}
+        effective_ticker = self.market_ticker if ticker is None else ticker
+        params = {"status": status}
+        if effective_ticker:
+            params["ticker"] = effective_ticker
         response = self.make_request("GET", path, params=params)
         orders = response.get("orders", [])
         self.logger.info(f"Retrieved {len(orders)} orders")
+        return orders
+
+    def list_all_resting_orders(
+        self,
+        ticker: Optional[str] = None,
+        page_limit: int = 200,
+        max_pages: int = 20,
+    ) -> List[Dict]:
+        orders: List[Dict] = []
+        cursor = None
+        pages = 0
+
+        safe_page_limit = max(1, min(1000, page_limit))
+        safe_max_pages = max(1, max_pages)
+
+        while True:
+            path = "/portfolio/orders"
+            params = {"status": "resting", "limit": safe_page_limit}
+            if ticker:
+                params["ticker"] = ticker
+            if cursor:
+                params["cursor"] = cursor
+
+            response = self.make_request("GET", path, params=params)
+            batch = response.get("orders", [])
+            orders.extend(batch)
+
+            pages += 1
+            cursor = response.get("cursor")
+
+            if not cursor:
+                break
+            if pages >= safe_max_pages:
+                break
+
+        self.logger.info(f"Retrieved {len(orders)} total resting orders")
         return orders
 
     def list_markets(

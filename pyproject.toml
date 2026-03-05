@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 kalshi-mm = "runner:main"
+kalshi-cancel-all = "cancel_all_orders:main"
 
 [tool.setuptools]
-py-modules = ["runner", "mm"]
+py-modules = ["runner", "mm", "cancel_all_orders"]

@@ -34,27 +34,60 @@ dynamic:
     trade_side: "yes"
    market_selector:
       enabled: true
-      top_n: 8
-      refresh_seconds: 20
-      min_volume_24h: 100
-      min_spread_cents: 1
-      volume_weight: 0.5
-      spread_weight: 0.5
+      top_n: 3
+      refresh_seconds: 45
+      worker_shutdown_timeout_seconds: 15
+      min_volume_24h: 500
+      min_spread_cents: 2
+      volume_weight: 0.35
+      spread_weight: 0.65
+      page_limit: 250
+      max_pages: 5
+      max_markets: 1250
       # series_ticker: "FED"
   market_maker:
-    max_position: 5
-    order_expiration: 28800
-    gamma: 0.1
+      max_position: 3
+      order_expiration: 3600
+      gamma: 0.2
     k: 1.5
     sigma: 0.001
     T: 28800
-    min_spread: 0.0
-    position_limit_buffer: 0.1
+      min_spread: 0.02
+      position_limit_buffer: 0.05
     inventory_skew_factor: 0.001
-  dt: 2.0
+      trade_side: "yes"
+   dt: 5.0
 ```
 
 At each selector refresh, the runner scans open markets from Kalshi, ranks by weighted normalized volume/spread, and maintains workers for the current top-N tickers.
+When a ticker is deselected, the runner enforces a cleanup sequence: stop worker, wait up to `worker_shutdown_timeout_seconds`, cancel resting orders for that ticker, and verify cleanup before removing it from active state.
+
+## Cancel All Resting Orders
+
+Use the operational command below to cancel resting orders across all markets.
+
+```bash
+kalshi-cancel-all
+```
+
+Optional flags:
+
+- Preview only (no cancel):
+   ```bash
+   kalshi-cancel-all --dry-run
+   ```
+- Restrict to one market ticker:
+   ```bash
+   kalshi-cancel-all --ticker FEDDECISION-24NOV-H0
+   ```
+- Restrict by side or action:
+   ```bash
+   kalshi-cancel-all --side yes --action buy
+   ```
+- Limit cancellations:
+   ```bash
+   kalshi-cancel-all --max-cancels 10
+   ```
 
 ## Deploying on fly.io
 
