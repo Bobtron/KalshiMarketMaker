@@ -122,9 +122,25 @@ Liquidation controls:
 kalshi-cancel-all --liquidate-all --max-liquidations 25 --liquidation-expiration-seconds 120
 ```
 
+Aggressive multi-round liquidation (recommended when you need out fast):
+
+```bash
+kalshi-cancel-all --liquidate-all \
+   --liquidation-rounds 12 \
+   --liquidation-round-sleep-seconds 1 \
+   --liquidation-price-offset-cents 2 \
+   --liquidation-expiration-seconds 20
+```
+
 Note: liquidation currently uses signed-yes position convention:
 - `position > 0` -> `sell yes` at current `yes_bid`
 - `position < 0` -> `buy yes` at current `yes_ask`
+
+In aggressive liquidation mode, each round:
+- cancels remaining resting orders,
+- refreshes live positions,
+- re-prices flattening orders with configurable aggressiveness,
+- repeats until flat or max rounds reached.
 
 ## Deployment
 

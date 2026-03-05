@@ -24,6 +24,35 @@ def parse_position(raw_position) -> int:
         return 0
 
 
+def cancel_order_batch(api, orders: List[Dict], logger, dry_run: bool) -> Dict[str, int]:
+    canceled = 0
+    failed = 0
+
+    for order in orders:
+        order_id = order.get("order_id")
+        if order_id is None:
+            failed += 1
+            logger.error("Skipping order without order_id")
+            continue
+
+        if dry_run:
+            logger.warning(f"[DRY-RUN] Would cancel order {order_id}")
+            continue
+
+        try:
+            success = api.cancel_order(order_id)
+            if success:
+                canceled += 1
+            else:
+                failed += 1
+                logger.error(f"Cancel returned no reduction for order {order_id}")
+        except Exception as cancel_exception:
+            failed += 1
+            logger.error(f"Failed to cancel order {order_id}: {cancel_exception}")
+
+    return {"canceled": canceled, "failed": failed}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Cancel resting Kalshi orders (all tickers by default)")
     parser.add_argument("--ticker", type=str, default=None, help="Optional market ticker filter")
@@ -44,8 +73,26 @@ def main():
     parser.add_argument(
         "--liquidation-expiration-seconds",
         type=int,
-        default=120,
+        default=30,
         help="Expiration horizon for liquidation orders",
+    )
+    parser.add_argument(
+        "--liquidation-rounds",
+        type=int,
+        default=8,
+        help="Maximum liquidation rounds (cancel + reprice + submit + recheck)",
+    )
+    parser.add_argument(
+        "--liquidation-round-sleep-seconds",
+        type=float,
+        default=1.5,
+        help="Sleep between liquidation rounds",
+    )
+    parser.add_argument(
+        "--liquidation-price-offset-cents",
+        type=int,
+        default=1,
+        help="Extra aggressiveness in cents when pricing liquidation orders",
     )
     parser.add_argument("--dry-run", action="store_true", help="Preview matching orders without canceling")
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level")
@@ -75,126 +122,151 @@ def main():
         else:
             logger.info("No matching resting orders found.")
 
-        if args.dry_run:
-            logger.warning("Dry-run enabled: no order cancellations executed")
-        else:
-            canceled = 0
-            failed = 0
-
-            for order in filtered_orders:
-                order_id = order.get("order_id")
-                if order_id is None:
-                    failed += 1
-                    logger.error("Skipping order without order_id")
-                    continue
-
-                try:
-                    success = api.cancel_order(order_id)
-                    if success:
-                        canceled += 1
-                    else:
-                        failed += 1
-                        logger.error(f"Cancel returned no reduction for order {order_id}")
-                except Exception as cancel_exception:
-                    failed += 1
-                    logger.error(f"Failed to cancel order {order_id}: {cancel_exception}")
-
-            logger.info(
-                f"Cancellation complete. canceled={canceled}, failed={failed}, total_attempted={len(filtered_orders)}"
-            )
+        cancel_summary = cancel_order_batch(api, filtered_orders, logger, args.dry_run)
+        logger.info(
+            f"Cancellation complete. canceled={cancel_summary['canceled']}, failed={cancel_summary['failed']}, "
+            f"total_attempted={len(filtered_orders)}"
+        )
 
         if not args.liquidate_all:
             return
 
-        positions = api.list_all_positions()
-        liquidation_candidates = []
+        max_rounds = max(1, args.liquidation_rounds)
+        round_sleep = max(0.0, args.liquidation_round_sleep_seconds)
+        price_offset_cents = max(0, args.liquidation_price_offset_cents)
+        expiration_seconds = max(1, args.liquidation_expiration_seconds)
+        remaining_liquidation_budget = (
+            args.max_liquidations if args.max_liquidations is not None and args.max_liquidations >= 0 else None
+        )
 
-        for position in positions:
+        total_submitted = 0
+        total_failed = 0
+
+        logger.warning(
+            "Starting aggressive liquidation mode: repeated cancel + reprice + submit until flat or max rounds"
+        )
+
+        for round_index in range(1, max_rounds + 1):
+            if remaining_liquidation_budget is not None and remaining_liquidation_budget <= 0:
+                logger.warning("Liquidation budget exhausted before flat positions")
+                break
+
+            logger.warning(f"Liquidation round {round_index}/{max_rounds}")
+
+            round_resting_orders = api.list_all_resting_orders(ticker=args.ticker)
+            if round_resting_orders:
+                logger.warning(f"Round {round_index}: canceling {len(round_resting_orders)} resting orders before flattening")
+                cancel_order_batch(api, round_resting_orders, logger, args.dry_run)
+
+            positions = api.list_all_positions()
+            liquidation_candidates = []
+
+            for position in positions:
+                ticker = position.get("ticker")
+                if not ticker:
+                    continue
+                if args.ticker and ticker != args.ticker:
+                    continue
+
+                signed_position = parse_position(position.get("position", 0))
+                if signed_position == 0:
+                    continue
+
+                market = api.get_market(ticker)
+                market_data = market.get("market", {})
+
+                if signed_position > 0:
+                    action = "sell"
+                    side = "yes"
+                    best_bid = market_data.get("yes_bid")
+                    if best_bid is None:
+                        logger.error(f"Skipping liquidation for {ticker}: missing yes_bid")
+                        continue
+                    price_cents = max(1, int(best_bid) - price_offset_cents)
+                    quantity = signed_position
+                else:
+                    action = "buy"
+                    side = "yes"
+                    best_ask = market_data.get("yes_ask")
+                    if best_ask is None:
+                        logger.error(f"Skipping liquidation for {ticker}: missing yes_ask")
+                        continue
+                    price_cents = min(99, int(best_ask) + price_offset_cents)
+                    quantity = abs(signed_position)
+
+                liquidation_candidates.append(
+                    {
+                        "ticker": ticker,
+                        "action": action,
+                        "side": side,
+                        "price": float(price_cents) / 100,
+                        "quantity": quantity,
+                        "signed_position": signed_position,
+                    }
+                )
+
+            if not liquidation_candidates:
+                logger.warning("No non-zero positions found. Liquidation complete.")
+                break
+
+            if remaining_liquidation_budget is not None:
+                liquidation_candidates = liquidation_candidates[:remaining_liquidation_budget]
+
+            for candidate in liquidation_candidates:
+                logger.warning(
+                    f"Round {round_index}: liquidate ticker={candidate['ticker']} pos={candidate['signed_position']} "
+                    f"via {candidate['action']} {candidate['side']} qty={candidate['quantity']} @ {candidate['price']:.2f}"
+                )
+
+            if args.dry_run:
+                logger.warning("Dry-run enabled: no liquidation orders executed")
+                break
+
+            expiration_ts = int(time.time()) + expiration_seconds
+
+            for candidate in liquidation_candidates:
+                try:
+                    order_id = api.place_order_for_ticker(
+                        ticker=candidate["ticker"],
+                        action=candidate["action"],
+                        side=candidate["side"],
+                        price=candidate["price"],
+                        quantity=candidate["quantity"],
+                        expiration_ts=expiration_ts,
+                    )
+                    total_submitted += 1
+                    logger.warning(f"Submitted liquidation order {order_id} for {candidate['ticker']}")
+                except Exception as liquidation_exception:
+                    total_failed += 1
+                    logger.error(
+                        f"Failed liquidation for {candidate['ticker']}: {liquidation_exception}"
+                    )
+
+            if remaining_liquidation_budget is not None:
+                remaining_liquidation_budget -= len(liquidation_candidates)
+
+            if round_index < max_rounds:
+                time.sleep(round_sleep)
+
+        final_positions = api.list_all_positions()
+        remaining_non_zero = []
+        for position in final_positions:
             ticker = position.get("ticker")
             if not ticker:
                 continue
             if args.ticker and ticker != args.ticker:
                 continue
-
             signed_position = parse_position(position.get("position", 0))
-            if signed_position == 0:
-                continue
+            if signed_position != 0:
+                remaining_non_zero.append((ticker, signed_position))
 
-            market = api.get_market(ticker)
-            market_data = market.get("market", {})
-
-            if signed_position > 0:
-                action = "sell"
-                side = "yes"
-                price_cents = market_data.get("yes_bid")
-                quantity = signed_position
-            else:
-                action = "buy"
-                side = "yes"
-                price_cents = market_data.get("yes_ask")
-                quantity = abs(signed_position)
-
-            if price_cents is None:
-                logger.error(f"Skipping liquidation for {ticker}: missing market quote")
-                continue
-
-            liquidation_candidates.append(
-                {
-                    "ticker": ticker,
-                    "action": action,
-                    "side": side,
-                    "price": float(price_cents) / 100,
-                    "quantity": quantity,
-                    "signed_position": signed_position,
-                }
-            )
-
-        if args.max_liquidations is not None and args.max_liquidations >= 0:
-            liquidation_candidates = liquidation_candidates[: args.max_liquidations]
+        if remaining_non_zero:
+            logger.error(f"Liquidation ended with remaining inventory: {remaining_non_zero}")
+        else:
+            logger.warning("Liquidation ended flat for selected scope")
 
         logger.warning(
-            f"Liquidation mode selected. Candidates={len(liquidation_candidates)} (signed-yes position convention)."
-        )
-
-        for candidate in liquidation_candidates:
-            logger.warning(
-                f"Liquidate ticker={candidate['ticker']} pos={candidate['signed_position']} "
-                f"via {candidate['action']} {candidate['side']} qty={candidate['quantity']} @ {candidate['price']:.2f}"
-            )
-
-        if not liquidation_candidates:
-            logger.info("No non-zero positions found for liquidation")
-            return
-
-        if args.dry_run:
-            logger.warning("Dry-run enabled: no liquidation orders executed")
-            return
-
-        liquidation_success = 0
-        liquidation_failed = 0
-        expiration_ts = int(time.time()) + max(1, args.liquidation_expiration_seconds)
-
-        for candidate in liquidation_candidates:
-            try:
-                order_id = api.place_order_for_ticker(
-                    ticker=candidate["ticker"],
-                    action=candidate["action"],
-                    side=candidate["side"],
-                    price=candidate["price"],
-                    quantity=candidate["quantity"],
-                    expiration_ts=expiration_ts,
-                )
-                liquidation_success += 1
-                logger.warning(f"Submitted liquidation order {order_id} for {candidate['ticker']}")
-            except Exception as liquidation_exception:
-                liquidation_failed += 1
-                logger.error(
-                    f"Failed liquidation for {candidate['ticker']}: {liquidation_exception}"
-                )
-
-        logger.warning(
-            f"Liquidation complete. submitted={liquidation_success}, failed={liquidation_failed}, "
-            f"total_attempted={len(liquidation_candidates)}"
+            f"Liquidation summary. submitted={total_submitted}, failed={total_failed}, remaining_positions={len(remaining_non_zero)}"
         )
     finally:
         api.logout()
