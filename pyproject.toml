@@ -16,8 +16,10 @@ dependencies = [
 ]
 
 [project.scripts]
-kalshi-mm = "runner:main"
-kalshi-cancel-all = "cancel_all_orders:main"
+kalshi-mm = "kalshi_market_maker.cli.mm:main"
+kalshi-cancel-all = "kalshi_market_maker.cli.cancel_all:main"
 
 [tool.setuptools]
-py-modules = ["runner", "mm", "cancel_all_orders"]
+
+[tool.setuptools.packages.find]
+include = ["kalshi_market_maker*"]

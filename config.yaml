@@ -1,9 +1,6 @@
 dynamic:
   log_level: INFO
-  api:
-    trade_side: "yes"
   market_selector:
-    enabled: true
     top_n: 50
     refresh_seconds: 45
     worker_shutdown_timeout_seconds: 15
@@ -24,6 +21,6 @@ dynamic:
     T: 28800
     min_spread: 0.02
     position_limit_buffer: 0.05
-    inventory_skew_factor: 0.001
+    inventory_skew_factor: 0.1
     trade_side: "yes"
   dt: 5.0
