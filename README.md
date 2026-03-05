@@ -1,6 +1,7 @@
 # Kalshi Market Making Algorithm
 
-This project implements a market making algorithm for Kalshi markets, capable of running multiple strategies in parallel. Its most involved algorithm implementaiton is the Avellaneda-Stoikov model.
+This project implements a market making algorithm for Kalshi markets. It now supports a simple dynamic mode with a two-step flow:
+1) select top markets by volume + spread, and 2) run Avellaneda-Stoikov market making on those selected tickers.
 
 ## Local Setup
 
@@ -16,7 +17,7 @@ This project implements a market making algorithm for Kalshi markets, capable of
    KALSHI_BASE_URL=https://demo-api.kalshi.co/trade-api/v2
    ```
    Use `https://api.elections.kalshi.com/trade-api/v2` for production.
-4. Create or modify the `config.yaml` file with your market making configurations. Each configuration in this file will run as a separate strategy.
+4. Create or modify `config.yaml`.
 5. Run the script:
    ```
    kalshi-mm --config config.yaml
@@ -24,19 +25,22 @@ This project implements a market making algorithm for Kalshi markets, capable of
 
 ## Configuration
 
-The `config.yaml` file should contain one or more strategy configurations. Each strategy should have a unique name and include the following sections:
-
-- `api`: Specifies the market ticker and trade side.
-- `market_maker`: Defines parameters for the Avellaneda market maker algorithm.
-- `dt`: The time step for the market maker's main loop.
-
-Example:
+Use dynamic mode with one `dynamic` block:
 
 ```yaml
-strategy_name:
+dynamic:
+   log_level: INFO
   api:
-    market_ticker: MARKET-TICKER
     trade_side: "yes"
+   market_selector:
+      enabled: true
+      top_n: 8
+      refresh_seconds: 20
+      min_volume_24h: 100
+      min_spread_cents: 1
+      volume_weight: 0.5
+      spread_weight: 0.5
+      # series_ticker: "FED"
   market_maker:
     max_position: 5
     order_expiration: 28800
@@ -50,7 +54,7 @@ strategy_name:
   dt: 2.0
 ```
 
-You can define multiple strategies in the same file. The runner will execute all strategies in parallel.
+At each selector refresh, the runner scans open markets from Kalshi, ranks by weighted normalized volume/spread, and maintains workers for the current top-N tickers.
 
 ## Deploying on fly.io
 
@@ -70,17 +74,17 @@ You can define multiple strategies in the same file. The runner will execute all
    flyctl secrets set KALSHI_PRIVATE_KEY_PATH=/app/keys/kalshi-private.key
    flyctl secrets set KALSHI_BASE_URL=https://demo-api.kalshi.co/trade-api/v2
    ```
-5. Ensure your `config.yaml` file is in the project directory and contains all the strategies you want to run.
+5. Ensure your `config.yaml` file is in the project directory and contains your `dynamic` settings.
 6. Deploy the app:
    ```
    flyctl deploy
    ```
 
-The deployment will use the `runner.py` script, which will run all strategies defined in your `config.yaml` file in parallel.
+The deployment will use `runner.py`, which runs the selector loop and manages top-N market-maker workers.
 
 ## Monitoring
 
-Each strategy will log its activities to a separate log file named after the strategy (e.g., `strategy_name.log`). You can monitor these logs using the fly.io logging system:
+Runtime output is written to standard output (console), which can be monitored via fly.io logs:
 
 ```
 flyctl logs

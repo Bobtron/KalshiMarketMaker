@@ -4,7 +4,10 @@ from concurrent.futures import ThreadPoolExecutor
 import yaml
 from dotenv import load_dotenv
 import os
-from typing import Dict
+from typing import Dict, List, Tuple
+import threading
+import time
+import requests
 
 from mm import KalshiTradingAPI, AvellanedaMarketMaker
 
@@ -12,11 +15,12 @@ def load_config(config_file):
     with open(config_file, 'r') as f:
         return yaml.safe_load(f)
 
-def create_api(api_config, logger):
+def create_api(api_config, logger, market_ticker: str = None):
+    ticker = market_ticker if market_ticker is not None else api_config.get('market_ticker', 'DYNAMIC')
     return KalshiTradingAPI(
         api_key_id=os.getenv("KALSHI_API_KEY_ID"),
         private_key_path=os.getenv("KALSHI_PRIVATE_KEY_PATH"),
-        market_ticker=api_config['market_ticker'],
+        market_ticker=ticker,
         base_url=os.getenv("KALSHI_BASE_URL"),
         logger=logger,
     )
@@ -38,28 +42,15 @@ def create_market_maker(mm_config, api, logger):
     )
 
 def run_strategy(config_name: str, config: Dict):
-    os.makedirs("runs", exist_ok=True)
-
-    # Create a logger for this specific strategy
     logger = logging.getLogger(f"Strategy_{config_name}")
     logger.setLevel(config.get('log_level', 'INFO'))
 
-    # Create file handler
-    fh = logging.FileHandler(os.path.join("runs", f"{config_name}.log"))
-    fh.setLevel(config.get('log_level', 'INFO'))
-    
-    # Create console handler
-    ch = logging.StreamHandler()
-    ch.setLevel(config.get('log_level', 'INFO'))
-    
-    # Create formatter
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    fh.setFormatter(formatter)
-    ch.setFormatter(formatter)
-    
-    # Add handlers to logger
-    logger.addHandler(fh)
-    logger.addHandler(ch)
+    if not logger.handlers:
+        ch = logging.StreamHandler()
+        ch.setLevel(config.get('log_level', 'INFO'))
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
 
     logger.info(f"Starting strategy: {config_name}")
 
@@ -80,6 +71,183 @@ def run_strategy(config_name: str, config: Dict):
         # Ensure logout happens even if an exception occurs
         api.logout()
 
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+def _compute_spread_cents(market: Dict) -> float:
+    yes_bid = _safe_float(market.get("yes_bid"), -1)
+    yes_ask = _safe_float(market.get("yes_ask"), -1)
+    if yes_bid < 0 or yes_ask < 0:
+        return -1
+    return yes_ask - yes_bid
+
+def select_top_markets(markets: List[Dict], selector_cfg: Dict) -> List[Tuple[str, float, float, float]]:
+    min_volume_24h = _safe_float(selector_cfg.get("min_volume_24h", 100))
+    min_spread_cents = _safe_float(selector_cfg.get("min_spread_cents", 1))
+    top_n = int(selector_cfg.get("top_n", 8))
+    volume_weight = _safe_float(selector_cfg.get("volume_weight", 0.5))
+    spread_weight = _safe_float(selector_cfg.get("spread_weight", 0.5))
+
+    candidates = []
+    for market in markets:
+        ticker = market.get("ticker")
+        if not ticker:
+            continue
+
+        volume_24h = _safe_float(market.get("volume_24h", market.get("volume", 0)))
+        spread_cents = _compute_spread_cents(market)
+
+        if volume_24h < min_volume_24h:
+            continue
+        if spread_cents < min_spread_cents:
+            continue
+
+        candidates.append(
+            {
+                "ticker": ticker,
+                "volume_24h": volume_24h,
+                "spread_cents": spread_cents,
+            }
+        )
+
+    if not candidates:
+        return []
+
+    volumes = [m["volume_24h"] for m in candidates]
+    spreads = [m["spread_cents"] for m in candidates]
+
+    min_v, max_v = min(volumes), max(volumes)
+    min_s, max_s = min(spreads), max(spreads)
+
+    def normalize(value: float, min_value: float, max_value: float) -> float:
+        if max_value == min_value:
+            return 1.0
+        return (value - min_value) / (max_value - min_value)
+
+    ranked = []
+    for market in candidates:
+        volume_norm = normalize(market["volume_24h"], min_v, max_v)
+        spread_norm = normalize(market["spread_cents"], min_s, max_s)
+        score = volume_weight * volume_norm + spread_weight * spread_norm
+        ranked.append((market["ticker"], score, market["volume_24h"], market["spread_cents"]))
+
+    ranked.sort(key=lambda row: row[1], reverse=True)
+    return ranked[:top_n]
+
+def run_market_worker(ticker: str, dynamic_config: Dict, stop_event: threading.Event):
+    logger = logging.getLogger(f"Worker_{ticker}")
+    log_level = dynamic_config.get('log_level', 'INFO')
+    logger.setLevel(log_level)
+    if not logger.handlers:
+        ch = logging.StreamHandler()
+        ch.setLevel(log_level)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+
+    api = create_api(dynamic_config.get("api", {}), logger, market_ticker=ticker)
+    mm_config = dynamic_config.get("market_maker", {})
+    market_maker = create_market_maker(mm_config, api, logger)
+    dt = dynamic_config.get("dt", 2.0)
+
+    try:
+        logger.info(f"Starting market maker worker for {ticker}")
+        market_maker.run(dt, stop_event=stop_event)
+    except Exception as exc:
+        logger.error(f"Worker failed for {ticker}: {exc}")
+    finally:
+        api.logout()
+
+def run_dynamic_strategy(dynamic_config: Dict):
+    logger = logging.getLogger("DynamicSelector")
+    log_level = dynamic_config.get('log_level', 'INFO')
+    logger.setLevel(log_level)
+    if not logger.handlers:
+        ch = logging.StreamHandler()
+        ch.setLevel(log_level)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+
+    selector_cfg = dynamic_config.get("market_selector", {})
+    refresh_seconds = _safe_float(selector_cfg.get("refresh_seconds", 20), 20.0)
+    series_ticker = selector_cfg.get("series_ticker")
+    page_limit = int(selector_cfg.get("page_limit", 250))
+    max_pages = int(selector_cfg.get("max_pages", 5))
+    max_markets = int(selector_cfg.get("max_markets", 1250))
+
+    selector_api = create_api(dynamic_config.get("api", {}), logger, market_ticker="DYNAMIC")
+    active_workers: Dict[str, Tuple[threading.Event, object]] = {}
+    max_workers = int(selector_cfg.get("top_n", 8)) + 1
+    last_selected_tickers: List[str] = []
+    selector_backoff_seconds = 5.0
+    max_selector_backoff_seconds = 120.0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        try:
+            while True:
+                markets: List[Dict] = []
+                selected_tickers = last_selected_tickers
+
+                try:
+                    markets = selector_api.list_all_open_markets(
+                        series_ticker=series_ticker,
+                        page_limit=page_limit,
+                        max_pages=max_pages,
+                        max_markets=max_markets,
+                    )
+                    ranked = select_top_markets(markets, selector_cfg)
+                    selected_tickers = [ticker for ticker, _, _, _ in ranked]
+                    last_selected_tickers = selected_tickers
+                    selector_backoff_seconds = 5.0
+                except requests.exceptions.HTTPError as exc:
+                    status_code = exc.response.status_code if exc.response is not None else None
+                    if status_code == 429:
+                        logger.warning(
+                            f"Selector rate-limited (429). Reusing previous selection for now and backing off for "
+                            f"{selector_backoff_seconds:.1f}s"
+                        )
+                        time.sleep(selector_backoff_seconds)
+                        selector_backoff_seconds = min(
+                            selector_backoff_seconds * 2,
+                            max_selector_backoff_seconds,
+                        )
+                    else:
+                        logger.error(f"Selector HTTP error ({status_code}): {exc}")
+                        time.sleep(selector_backoff_seconds)
+                except requests.exceptions.RequestException as exc:
+                    logger.error(f"Selector request error: {exc}")
+                    time.sleep(selector_backoff_seconds)
+
+                selected_set = set(selected_tickers)
+
+                logger.info(f"Selector found {len(markets)} open markets; selected: {selected_tickers}")
+
+                for ticker in list(active_workers.keys()):
+                    stop_event, _future = active_workers[ticker]
+                    if ticker not in selected_set:
+                        logger.info(f"Stopping worker for {ticker} (no longer selected)")
+                        stop_event.set()
+                        del active_workers[ticker]
+
+                for ticker in selected_tickers:
+                    if ticker not in active_workers:
+                        logger.info(f"Starting worker for selected ticker {ticker}")
+                        stop_event = threading.Event()
+                        future = executor.submit(run_market_worker, ticker, dynamic_config, stop_event)
+                        active_workers[ticker] = (stop_event, future)
+
+                time.sleep(refresh_seconds)
+        except KeyboardInterrupt:
+            logger.info("Received keyboard interrupt, shutting down dynamic strategy")
+        finally:
+            for stop_event, _future in active_workers.values():
+                stop_event.set()
+            selector_api.logout()
+
 def main():
     parser = argparse.ArgumentParser(description="Kalshi Market Making Algorithm")
     parser.add_argument("--config", type=str, default="config.yaml", help="Path to config file")
@@ -91,12 +259,15 @@ def main():
     # Load environment variables
     load_dotenv()
 
-    # Print the name of every strategy being run
+    if isinstance(configs, dict) and "dynamic" in configs:
+        print("Starting dynamic strategy mode")
+        run_dynamic_strategy(configs["dynamic"])
+        return
+
     print("Starting the following strategies:")
     for config_name in configs:
         print(f"- {config_name}")
 
-    # Run all strategies in parallel using ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=len(configs)) as executor:
         for config_name, config in configs.items():
             executor.submit(run_strategy, config_name, config)

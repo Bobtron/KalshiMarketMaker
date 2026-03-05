@@ -1,47 +1,28 @@
-RATECUTCOUNT-24DEC31-T4:
+dynamic:
+  log_level: INFO
   api:
-    market_ticker: RATECUTCOUNT-24DEC31-T4
     trade_side: "yes"
+  market_selector:
+    enabled: true
+    top_n: 30
+    refresh_seconds: 45
+    min_volume_24h: 0
+    min_spread_cents: 0
+    volume_weight: 0.35
+    spread_weight: 0.65
+    page_limit: 250
+    max_pages: 5
+    max_markets: 1250
+    # series_ticker: "FED"
   market_maker:
-    max_position: 5
-    order_expiration: 28800 # 8 hours
-    gamma: 0.1
+    max_position: 3
+    order_expiration: 3600
+    gamma: 0.2
     k: 1.5
     sigma: 0.001
-    T: 28800 # 8 hours
-    min_spread: 0.0
-    position_limit_buffer: 0.1
+    T: 28800
+    min_spread: 0.02
+    position_limit_buffer: 0.05
     inventory_skew_factor: 0.001
-  dt: 2.0
-
-FEDDECISION-24NOV-C25:
-  api:
-    market_ticker: FEDDECISION-24NOV-C25
     trade_side: "yes"
-  market_maker:
-    max_position: 5
-    order_expiration: 28800 # 8 hours
-    gamma: 0.1
-    k: 1.5
-    sigma: 0.001
-    T: 28800 # 8 hours
-    min_spread: 0.0
-    position_limit_buffer: 0.1
-    inventory_skew_factor: 0.001
-  dt: 2.0
-
-FEDDECISION-24NOV-H0:
-  api:
-    market_ticker: FEDDECISION-24NOV-H0
-    trade_side: "yes"
-  market_maker:
-    max_position: 5
-    order_expiration: 28800 # 8 hours
-    gamma: 0.1
-    k: 1.5
-    sigma: 0.001
-    T: 28800 # 8 hours
-    min_spread: 0.0
-    position_limit_buffer: 0.1
-    inventory_skew_factor: 0.001
-  dt: 2.0
+  dt: 5.0

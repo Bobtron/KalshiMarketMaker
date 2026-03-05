@@ -6,6 +6,7 @@ import requests
 import logging
 import uuid
 import math
+import random
 from urllib.parse import urlparse
 
 from cryptography.hazmat.primitives import serialization, hashes
@@ -80,29 +81,67 @@ class KalshiTradingAPI(AbstractTradingAPI):
         }
 
     def make_request(
-        self, method: str, path: str, params: Dict = None, data: Dict = None
+        self,
+        method: str,
+        path: str,
+        params: Dict = None,
+        data: Dict = None,
+        max_retries: int = 5,
     ):
         url = f"{self.base_url}{path}"
         parsed_path = urlparse(url).path
-        headers = self.get_headers(method, parsed_path)
+        retryable_codes = {429, 500, 502, 503, 504}
 
-        try:
-            response = requests.request(
-                method, url, headers=headers, params=params, json=data
-            )
-            self.logger.debug(f"Request URL: {response.url}")
-            self.logger.debug(f"Request headers: {response.request.headers}")
-            self.logger.debug(f"Request params: {params}")
-            self.logger.debug(f"Request data: {data}")
-            self.logger.debug(f"Response status code: {response.status_code}")
-            self.logger.debug(f"Response content: {response.text}")
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"Request failed: {e}")
-            if hasattr(e, "response") and e.response is not None:
-                self.logger.error(f"Response content: {e.response.text}")
-            raise
+        for attempt in range(max_retries + 1):
+            headers = self.get_headers(method, parsed_path)
+            try:
+                response = requests.request(
+                    method,
+                    url,
+                    headers=headers,
+                    params=params,
+                    json=data,
+                    timeout=15,
+                )
+                self.logger.debug(f"Request URL: {response.url}")
+                self.logger.debug(f"Request params: {params}")
+                self.logger.debug(f"Request data: {data}")
+                self.logger.debug(f"Response status code: {response.status_code}")
+
+                if response.status_code in retryable_codes and attempt < max_retries:
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after is not None:
+                        try:
+                            delay_seconds = float(retry_after)
+                        except ValueError:
+                            delay_seconds = 0.0
+                    else:
+                        delay_seconds = 0.0
+
+                    backoff = max(delay_seconds, 0.5 * (2**attempt)) + random.uniform(0, 0.25)
+                    self.logger.warning(
+                        f"Retryable response {response.status_code} for {method} {path}; retrying in {backoff:.2f}s "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(backoff)
+                    continue
+
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries:
+                    backoff = 0.5 * (2**attempt) + random.uniform(0, 0.25)
+                    self.logger.warning(
+                        f"Request exception for {method} {path}: {e}. Retrying in {backoff:.2f}s "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(backoff)
+                    continue
+
+                self.logger.error(f"Request failed: {e}")
+                if hasattr(e, "response") and e.response is not None:
+                    self.logger.error(f"Response content: {e.response.text}")
+                raise
 
     def get_position(self) -> int:
         self.logger.info("Retrieving position...")
@@ -186,6 +225,57 @@ class KalshiTradingAPI(AbstractTradingAPI):
         self.logger.info(f"Retrieved {len(orders)} orders")
         return orders
 
+    def list_markets(
+        self,
+        status: str = "open",
+        limit: int = 1000,
+        cursor: str = None,
+        series_ticker: str = None,
+    ) -> Dict:
+        path = "/markets"
+        params = {"status": status, "limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        return self.make_request("GET", path, params=params)
+
+    def list_all_open_markets(
+        self,
+        series_ticker: str = None,
+        page_limit: int = 250,
+        max_pages: int = 5,
+        max_markets: int = 1250,
+    ) -> List[Dict]:
+        markets: List[Dict] = []
+        cursor = None
+        pages = 0
+
+        safe_page_limit = max(1, min(1000, page_limit))
+        safe_max_pages = max(1, max_pages)
+        safe_max_markets = max(1, max_markets)
+
+        while True:
+            response = self.list_markets(
+                status="open",
+                limit=safe_page_limit,
+                cursor=cursor,
+                series_ticker=series_ticker,
+            )
+            batch = response.get("markets", [])
+            markets.extend(batch)
+            pages += 1
+            cursor = response.get("cursor")
+
+            if len(markets) >= safe_max_markets:
+                break
+            if pages >= safe_max_pages:
+                break
+            if not cursor:
+                break
+
+        return markets[:safe_max_markets]
+
 class AvellanedaMarketMaker:
     def __init__(
         self,
@@ -215,9 +305,12 @@ class AvellanedaMarketMaker:
         self.inventory_skew_factor = inventory_skew_factor
         self.trade_side = trade_side
 
-    def run(self, dt: float):
+    def run(self, dt: float, stop_event=None):
         start_time = time.time()
         while time.time() - start_time < self.T:
+            if stop_event is not None and stop_event.is_set():
+                self.logger.info("Stop signal received, shutting down market maker loop")
+                break
             current_time = time.time() - start_time
             self.logger.info(f"Running Avellaneda market maker at {current_time:.2f}")
 
